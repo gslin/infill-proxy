@@ -5,3 +5,7 @@ Translates llama.cpp `/infill` requests (used by [llama.vim](https://github.com/
 ## License
 
 See [LICENSE](LICENSE).
+
+## Others
+
+This project is heavily relied on Claude Code.
