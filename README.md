@@ -8,4 +8,4 @@ See [LICENSE](LICENSE).
 
 ## Others
 
-This project is heavily relied on Claude Code.
+The development of this project is heavily relied on Claude Code.
