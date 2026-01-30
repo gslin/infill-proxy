@@ -33,6 +33,8 @@ try {
   // ignore invalid JSON, keep empty array
 }
 
+let currentInfillController = null;
+
 /**
  * Build the FIM content string shared by both prompt and chat modes.
  */
@@ -255,6 +257,18 @@ async function handleInfill(req, res, rawBody) {
     return;
   }
 
+  // Cancel any previous in-flight upstream request
+  if (currentInfillController) {
+    currentInfillController.abort();
+  }
+  const controller = new AbortController();
+  currentInfillController = controller;
+
+  // Cancel upstream request if client disconnects
+  req.on("close", () => {
+    controller.abort();
+  });
+
   // Intercept cache-warming requests (n_predict=0) from llama.vim.
   // OpenAI API has no cache-warming concept; return empty response immediately.
   if (body.n_predict === 0) {
@@ -314,6 +328,7 @@ async function handleInfill(req, res, rawBody) {
       method: "POST",
       headers,
       body: JSON.stringify(openaiBody),
+      signal: controller.signal,
     });
 
     if (!resp.ok) {
@@ -352,7 +367,22 @@ async function handleInfill(req, res, rawBody) {
       });
     }
   } catch (err) {
+    if (err.name === "AbortError") {
+      // Superseded by a newer request — return empty response
+      if (!res.headersSent) {
+        sendJSON(res, 200, {
+          content: "",
+          tokens_evaluated: 0,
+          tokens_predicted: 0,
+        });
+      }
+      return;
+    }
     sendJSON(res, 502, { error: { message: `Failed to reach upstream: ${err.message}` } });
+  } finally {
+    if (currentInfillController === controller) {
+      currentInfillController = null;
+    }
   }
 }
 

@@ -398,6 +398,105 @@ describe("HTTP integration", () => {
     assert.equal(res.status, 200);
   });
 
+  it("new infill request should cancel previous in-flight request", async () => {
+    let requestCount = 0;
+    mockHandler = async (req, res) => {
+      const idx = ++requestCount;
+      if (idx === 1) {
+        // First request: delay so the second request arrives while this is in-flight
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        // If we get here, the connection may already be aborted by the client fetch.
+        // The mock server still responds, but the proxy's fetch should have been aborted.
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          choices: [{ message: { content: "stale-response-A" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 5, completion_tokens: 1 },
+        }));
+      } else {
+        // Second request: respond immediately
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          choices: [{ message: { content: "fresh-response-B" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 5, completion_tokens: 1 },
+        }));
+      }
+    };
+
+    // Fire both requests concurrently
+    const [resA, resB] = await Promise.all([
+      proxyFetch("/infill", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ input_prefix: "old-context", input_suffix: "" }),
+      }),
+      // Slight delay to ensure A is dispatched first
+      new Promise((resolve) => setTimeout(resolve, 50)).then(() =>
+        proxyFetch("/infill", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ input_prefix: "new-context", input_suffix: "" }),
+        })
+      ),
+    ]);
+
+    // Request A should have been cancelled — returns empty content
+    const jsonA = await resA.json();
+    assert.equal(jsonA.content, "", "cancelled request should return empty content");
+
+    // Request B should get the fresh upstream response
+    const jsonB = await resB.json();
+    assert.equal(jsonB.content, "fresh-response-B");
+  });
+
+  it("client disconnect should cancel upstream request", async () => {
+    let upstreamRequestReceived = false;
+    let upstreamResponseSent = false;
+    mockHandler = async (req, res) => {
+      upstreamRequestReceived = true;
+      // Delay long enough for client to disconnect
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      if (!res.writableEnded) {
+        upstreamResponseSent = true;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          choices: [{ message: { content: "should-not-arrive" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 5, completion_tokens: 1 },
+        }));
+      }
+    };
+
+    const abortController = new AbortController();
+    const fetchPromise = proxyFetch("/infill", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ input_prefix: "test", input_suffix: "" }),
+      signal: abortController.signal,
+    });
+
+    // Wait a bit for the request to reach upstream, then abort the client
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    abortController.abort();
+
+    // The fetch should throw due to client-side abort
+    await assert.rejects(fetchPromise, (err) => err.name === "AbortError");
+
+    // Verify the upstream request was received (proxy forwarded it)
+    assert.equal(upstreamRequestReceived, true, "upstream should have received the request");
+
+    // Send a second request to supersede the first (since client disconnect
+    // triggers controller.abort(), which cancels the in-flight fetch)
+    mockHandler = async (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      }));
+    };
+
+    // Wait for the delayed mock to finish to avoid test interference
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  });
+
   it("POST /infill should strip repeated prefix context from response", async () => {
     mockHandler = async (_req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
